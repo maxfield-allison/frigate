@@ -1,5 +1,8 @@
 """Tests for per stream recording health tracking in the camera watchdog."""
 
+import subprocess as sp
+import sys
+import time
 import unittest
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock, patch
@@ -224,3 +227,60 @@ class TestCameraWatchdogStreamHealth(unittest.TestCase):
 
         assert watchdog.record_stale_threshold[STREAM_TYPE_MAIN] == 120
         assert watchdog.record_stale_threshold[STREAM_TYPE_SUB] == 150
+
+
+class TestCameraWatchdogReset(unittest.TestCase):
+    def _build_resettable_watchdog(self) -> CameraWatchdog:
+        watchdog = build_watchdog()
+        watchdog.ffmpeg_detect_process = MagicMock()
+        watchdog.capture_thread = MagicMock()
+        watchdog.capture_thread.is_alive.return_value = False
+        watchdog.start_ffmpeg_detect = MagicMock()
+        return watchdog
+
+    def test_reset_waits_without_reading_stdout(self):
+        watchdog = self._build_resettable_watchdog()
+        process = watchdog.ffmpeg_detect_process
+
+        watchdog.reset_capture_thread()
+
+        # communicate would read the detect process's raw frames into memory
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=30)
+        process.communicate.assert_not_called()
+        watchdog.start_ffmpeg_detect.assert_called_once()
+
+    def test_reset_force_kill_waits_without_reading_stdout(self):
+        watchdog = self._build_resettable_watchdog()
+        process = watchdog.ffmpeg_detect_process
+        process.wait.side_effect = [sp.TimeoutExpired("ffmpeg", 30), 0]
+
+        watchdog.reset_capture_thread()
+
+        process.kill.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        process.communicate.assert_not_called()
+        watchdog.start_ffmpeg_detect.assert_called_once()
+
+    def test_reset_reaps_process_blocked_on_full_stdout_pipe(self):
+        watchdog = self._build_resettable_watchdog()
+        # a real child that fills its stdout pipe with nothing reading it
+        process = sp.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys\nwhile True: sys.stdout.write('x' * 65536)",
+            ],
+            stdout=sp.PIPE,
+            stdin=sp.DEVNULL,
+        )
+        watchdog.ffmpeg_detect_process = process
+        time.sleep(0.5)
+
+        start = time.monotonic()
+        watchdog.reset_capture_thread()
+
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertIsNotNone(process.returncode)
+        watchdog.start_ffmpeg_detect.assert_called_once()
+        process.stdout.close()
